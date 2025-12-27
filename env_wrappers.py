@@ -322,6 +322,13 @@ class AddPolicyActionWrapper:
         return np.asarray(base_action)
 
     def reset(self, **kwargs) -> Any:
+        # If the base policy caches action chunks (e.g. RemotePolicy), clear it at episode start.
+        if hasattr(self.base_policy, "reset"):
+            try:
+                self.base_policy.reset()
+            except TypeError:
+                # Some policies may define reset() with a different signature; ignore.
+                pass
         out = self.env.reset(**kwargs)
         self._last_obs = _extract_obs_from_reset(out)
         # As soon as we have an obs, prefetch the base action for the *next* step call.
