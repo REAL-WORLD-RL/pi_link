@@ -4,8 +4,9 @@ from dataclasses import dataclass
 import logging
 import threading
 import time
-from typing import Any
+from typing import Any, Union
 
+import numpy as np
 import websockets.sync.client
 
 from pi_link import msgpack_numpy
@@ -14,14 +15,18 @@ from pi_link.spaces import space_from_spec
 
 @dataclass(frozen=True)
 class RemoteEnvStep:
+    """Step result supporting both single env (scalars) and vector env (arrays)."""
     obs: Any
-    reward: float
-    terminated: bool
-    truncated: bool
+    reward: Union[float, np.ndarray]  # scalar for single env, array for vec env
+    terminated: Union[bool, np.ndarray]  # scalar for single env, array for vec env
+    truncated: Union[bool, np.ndarray]  # scalar for single env, array for vec env
     info: dict
 
     @property
-    def done(self) -> bool:
+    def done(self) -> Union[bool, np.ndarray]:
+        """Returns done flag(s). For vec env, returns boolean array."""
+        if isinstance(self.terminated, np.ndarray) or isinstance(self.truncated, np.ndarray):
+            return self.terminated | self.truncated
         return bool(self.terminated or self.truncated)
 
 
@@ -225,13 +230,20 @@ class RemoteEnv:
             self.action_space = space_from_spec(resp["action_space_spec"])
         return resp.get("obs"), resp.get("info") or {}
 
-    def step(self, action: Any) -> tuple[Any, float, bool, bool, dict]:
-        """Gymnasium-style step: returns (obs, reward, terminated, truncated, info)."""
+    def step(self, action: Any) -> tuple[Any, Union[float, np.ndarray], Union[bool, np.ndarray], Union[bool, np.ndarray], dict]:
+        """Gymnasium-style step: returns (obs, reward, terminated, truncated, info).
+        
+        For vector envs, reward/terminated/truncated are numpy arrays.
+        For single envs, they are scalars (float/bool).
+        """
         s = self.step_struct(action)
         return s.obs, s.reward, s.terminated, s.truncated, s.info
 
-    def step_legacy(self, action: Any) -> tuple[Any, float, bool, dict]:
-        """Legacy convenience: returns (obs, reward, done, info)."""
+    def step_legacy(self, action: Any) -> tuple[Any, Union[float, np.ndarray], Union[bool, np.ndarray], dict]:
+        """Legacy convenience: returns (obs, reward, done, info).
+        
+        For vector envs, reward/done are numpy arrays.
+        """
         s = self.step_struct(action)
         return s.obs, s.reward, s.done, s.info
 
@@ -243,7 +255,7 @@ class RemoteEnv:
         else:
             resp = self._send({"cmd": "step", "action": action})
         obs = resp.get("obs")
-        reward = float(resp.get("reward", 0.0))
+        reward_raw = resp.get("reward", 0.0)
         # Strict protocol: require explicit gymnasium-style fields.
         if "terminated" not in resp or "truncated" not in resp:
             raise RuntimeError(
@@ -251,9 +263,22 @@ class RemoteEnv:
                 "`terminated` and `truncated` (no implicit fallback from `done`). "
                 f"Got keys={sorted(resp.keys())}"
             )
-        terminated = bool(resp["terminated"])
-        truncated = bool(resp["truncated"])
+        terminated_raw = resp["terminated"]
+        truncated_raw = resp["truncated"]
         info = resp.get("info") or {}
+        
+        # Support both single env (scalars) and vector env (arrays)
+        if isinstance(reward_raw, np.ndarray):
+            # Vector env: keep as arrays
+            reward = reward_raw
+            terminated = terminated_raw if isinstance(terminated_raw, np.ndarray) else np.asarray(terminated_raw)
+            truncated = truncated_raw if isinstance(truncated_raw, np.ndarray) else np.asarray(truncated_raw)
+        else:
+            # Single env: convert to scalars
+            reward = float(reward_raw)
+            terminated = bool(terminated_raw)
+            truncated = bool(truncated_raw)
+        
         return RemoteEnvStep(
             obs=obs, reward=reward, terminated=terminated, truncated=truncated, info=info
         )
