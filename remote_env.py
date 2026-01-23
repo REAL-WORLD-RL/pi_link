@@ -4,7 +4,8 @@ from dataclasses import dataclass
 import logging
 import threading
 import time
-from typing import Any
+from typing import Any, Union
+import numpy as np
 
 import websockets.sync.client
 
@@ -15,13 +16,15 @@ from pi_link.spaces import space_from_spec
 @dataclass(frozen=True)
 class RemoteEnvStep:
     obs: Any
-    reward: float
-    terminated: bool
-    truncated: bool
+    reward: Union[float, np.ndarray]  # 支持标量或批量 reward
+    terminated: Union[bool, np.ndarray]  # 支持标量或批量 terminated
+    truncated: Union[bool, np.ndarray]  # 支持标量或批量 truncated
     info: dict
 
     @property
-    def done(self) -> bool:
+    def done(self) -> Union[bool, np.ndarray]:
+        if isinstance(self.terminated, np.ndarray) or isinstance(self.truncated, np.ndarray):
+            return np.logical_or(self.terminated, self.truncated)
         return bool(self.terminated or self.truncated)
 
 
@@ -243,7 +246,14 @@ class RemoteEnv:
         else:
             resp = self._send({"cmd": "step", "action": action})
         obs = resp.get("obs")
-        reward = float(resp.get("reward", 0.0))
+        reward_raw = resp.get("reward", 0.0)
+        
+        # 支持批量 reward（如果是数组则保持，如果是标量则转为 float）
+        if isinstance(reward_raw, (list, np.ndarray)):
+            reward = np.asarray(reward_raw, dtype=np.float32)
+        else:
+            reward = float(reward_raw)
+            
         # Strict protocol: require explicit gymnasium-style fields.
         if "terminated" not in resp or "truncated" not in resp:
             raise RuntimeError(
@@ -251,8 +261,21 @@ class RemoteEnv:
                 "`terminated` and `truncated` (no implicit fallback from `done`). "
                 f"Got keys={sorted(resp.keys())}"
             )
-        terminated = bool(resp["terminated"])
-        truncated = bool(resp["truncated"])
+        
+        # 支持批量 terminated/truncated（如果是数组则保持，如果是标量则转为 bool）
+        terminated_raw = resp["terminated"]
+        truncated_raw = resp["truncated"]
+        
+        if isinstance(terminated_raw, (list, np.ndarray)):
+            terminated = np.asarray(terminated_raw, dtype=bool)
+        else:
+            terminated = bool(terminated_raw)
+            
+        if isinstance(truncated_raw, (list, np.ndarray)):
+            truncated = np.asarray(truncated_raw, dtype=bool)
+        else:
+            truncated = bool(truncated_raw)
+            
         info = resp.get("info") or {}
         return RemoteEnvStep(
             obs=obs, reward=reward, terminated=terminated, truncated=truncated, info=info
