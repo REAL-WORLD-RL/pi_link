@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 from typing import Callable
+import threading
 
 import websockets.sync.client
 
@@ -45,6 +46,7 @@ class RemotePolicy:
         self._api_key = api_key
         self._packer = msgpack_numpy.Packer()
         self._select_action = select_action or self._default_select_action
+        self._ws_lock = threading.Lock()  # 保护websocket的并发访问
 
         headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
         self._ws = websockets.sync.client.connect(
@@ -67,17 +69,42 @@ class RemotePolicy:
         self._ws.close()
 
     def raw_step(self, obs: dict) -> RemotePolicyResult:
-        data = self._packer.pack(obs)
-        self._ws.send(data)
-        resp = self._ws.recv()
-        if isinstance(resp, str):
-            raise RuntimeError(f"Policy server error:\n{resp}")
-        decoded: dict = msgpack_numpy.unpackb(resp)
-        return RemotePolicyResult(raw=decoded)
+        # 使用锁保证websocket的串行访问，避免并发冲突
+        with self._ws_lock:
+            data = self._packer.pack(obs)
+            self._ws.send(data)
+            resp = self._ws.recv()
+            if isinstance(resp, str):
+                raise RuntimeError(f"Policy server error:\n{resp}")
+            decoded: dict = msgpack_numpy.unpackb(resp)
+            
+            # # 调试：打印policy server返回的原始数据
+            # print("=" * 80)
+            # print("🔍 [RemotePolicy.raw_step] Policy server 返回的原始数据:")
+            # for k, v in decoded.items():
+            #     if hasattr(v, 'shape'):
+            #         print(f"  {k}: shape={v.shape}, dtype={v.dtype}")
+            #     else:
+            #         print(f"  {k}: type={type(v)}, value={v}")
+            # print("=" * 80)
+            
+            return RemotePolicyResult(raw=decoded)
 
     def step(self, obs: dict) -> Any:
         """Return an action suitable to feed into env.step(action)."""
-        return self._select_action(self.raw_step(obs).raw)
+        raw_result = self.raw_step(obs).raw
+        selected_action = self._select_action(raw_result)
+        
+        # # 调试：打印_select_action之后的结果
+        # print("=" * 80)
+        # print("🔍 [RemotePolicy.step] _select_action 之后的结果:")
+        # if hasattr(selected_action, 'shape'):
+        #     print(f"  shape={selected_action.shape}, dtype={selected_action.dtype}")
+        # else:
+        #     print(f"  type={type(selected_action)}")
+        # print("=" * 80)
+        
+        return selected_action
 
     @staticmethod
     def _default_select_action(result: dict) -> Any:

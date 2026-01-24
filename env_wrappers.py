@@ -202,25 +202,25 @@ class AddLeadingDimObsWrapper:
         return getattr(self.env, name)
 
 
-def _rename_reset_out(out: Any, mapping: Mapping[str, Any], strict: bool) -> Any:
+def _rename_reset_out(out: Any, mapping: Mapping[str, Any], strict: bool, filter_unmapped: bool = False) -> Any:
     # gymnasium style: (obs, info)
     if isinstance(out, tuple) and len(out) == 2:
         obs, info = out
-        return rename_obs_dict_keys(obs, mapping, strict=strict), info
+        return rename_obs_dict_keys(obs, mapping, strict=strict, filter_unmapped=filter_unmapped), info
     # gym / RemoteEnv style: obs only
-    return rename_obs_dict_keys(out, mapping, strict=strict)
+    return rename_obs_dict_keys(out, mapping, strict=strict, filter_unmapped=filter_unmapped)
 
 
-def _rename_step_out(out: Any, mapping: Mapping[str, Any], strict: bool) -> Any:
+def _rename_step_out(out: Any, mapping: Mapping[str, Any], strict: bool, filter_unmapped: bool = False) -> Any:
     # gym style: (obs, reward, done, info)
     if isinstance(out, tuple) and len(out) == 4:
         obs, reward, done, info = out
-        return rename_obs_dict_keys(obs, mapping, strict=strict), reward, done, info
+        return rename_obs_dict_keys(obs, mapping, strict=strict, filter_unmapped=filter_unmapped), reward, done, info
     # gymnasium style: (obs, reward, terminated, truncated, info)
     if isinstance(out, tuple) and len(out) == 5:
         obs, reward, terminated, truncated, info = out
         return (
-            rename_obs_dict_keys(obs, mapping, strict=strict),
+            rename_obs_dict_keys(obs, mapping, strict=strict, filter_unmapped=filter_unmapped),
             reward,
             terminated,
             truncated,
@@ -242,11 +242,14 @@ class ObsKeyRemapWrapper:
     env: EnvLike
     mapping: Mapping[str, Any]
     strict: bool = False
+    filter_unmapped: bool = False
 
     def __post_init__(self) -> None:
         # 1) Remap observation_space keys
         obs_space = getattr(self.env, "observation_space", None)
-        remapped_obs_space = rename_dict_space_keys(obs_space, self.mapping, strict=self.strict)
+        remapped_obs_space = rename_dict_space_keys(
+            obs_space, self.mapping, strict=self.strict, filter_unmapped=self.filter_unmapped
+        )
         # 2) Convert to gym spaces so SERL replay buffers (gym-based) don't trip on gymnasium spaces
         self.observation_space = _to_gym_space(remapped_obs_space)
 
@@ -254,10 +257,10 @@ class ObsKeyRemapWrapper:
         self.action_space = _to_gym_space(act_space)
 
     def reset(self, **kwargs) -> Any:
-        return _rename_reset_out(self.env.reset(**kwargs), self.mapping, self.strict)
+        return _rename_reset_out(self.env.reset(**kwargs), self.mapping, self.strict, self.filter_unmapped)
 
     def step(self, action: Any) -> Any:
-        return _rename_step_out(self.env.step(action), self.mapping, self.strict)
+        return _rename_step_out(self.env.step(action), self.mapping, self.strict, self.filter_unmapped)
 
     def close(self) -> Any:
         if hasattr(self.env, "close"):
@@ -286,6 +289,11 @@ class AddPolicyActionWrapper:
     clip_action: bool = False
     allow_none_delta: bool = True
     prefetch_base_action: bool = True
+    obs_mapping: Optional[_Mapping[str, str]] = None  # 为 base_policy 映射 obs keys
+    filter_unmapped_obs: bool = False  # 是否过滤未映射的 obs keys
+    remove_time_dim_for_policy: bool = False  # 是否为 policy 移除时间维度 (去掉 T 维度)
+    unbatch_obs_for_policy: bool = False  # 是否为 policy 移除 batch 维度 (只发送第一个样本)
+    broadcast_policy_action: bool = False  # 是否将 policy 返回的单个 action 广播到所有 batch
 
     def __post_init__(self) -> None:
         self.observation_space = getattr(self.env, "observation_space", None)
@@ -294,36 +302,229 @@ class AddPolicyActionWrapper:
         self._base_executor: Optional[_futures.ThreadPoolExecutor] = None
         self._base_future: Optional[_futures.Future] = None
         self._base_future_obs: Any = None
+        self._batch_size: int = 1  # 记录 batch size，用于 broadcast action
+        
+        # Action buffer for action chunking
+        self._action_buffer: Optional[np.ndarray] = None  # shape: (batch_size, action_horizon, action_dim)
+        self._action_buffer_index: int = 0  # 当前应该取 buffer 中的第几个 action
 
         if self.prefetch_base_action:
             # Single worker is enough: we only ever want the latest base action.
             self._base_executor = _futures.ThreadPoolExecutor(max_workers=1)
 
+    def _transform_obs_for_policy(self, obs: Any) -> Any:
+        """Transform obs for base_policy if obs_mapping is provided."""
+        if self.obs_mapping is None and not self.remove_time_dim_for_policy and not self.unbatch_obs_for_policy:
+            return obs
+        
+        # 调试：打印转换前后的 obs keys
+        if isinstance(obs, dict):
+            print(f"🔍 [AddPolicyActionWrapper] 转换前 obs keys: {sorted(obs.keys())}")
+            for k, v in obs.items():
+                if hasattr(v, 'shape'):
+                    print(f"    {k}: shape={v.shape}, dtype={v.dtype}")
+            print(f"🔍 [AddPolicyActionWrapper] obs_mapping: {self.obs_mapping}")
+            print(f"🔍 [AddPolicyActionWrapper] filter_unmapped_obs: {self.filter_unmapped_obs}")
+            print(f"🔍 [AddPolicyActionWrapper] remove_time_dim_for_policy: {self.remove_time_dim_for_policy}")
+            print(f"🔍 [AddPolicyActionWrapper] unbatch_obs_for_policy: {self.unbatch_obs_for_policy}")
+        
+        transformed_obs = obs
+        
+        # 步骤1: 如果配置了 obs_mapping，先进行 key 映射/过滤
+        if self.obs_mapping is not None:
+            transformed_obs = rename_obs_dict_keys(
+                transformed_obs, 
+                self.obs_mapping, 
+                strict=False, 
+                filter_unmapped=self.filter_unmapped_obs
+            )
+        
+        # 步骤2: 如果需要，移除 batch 维度 (只取第一个样本)
+        if self.unbatch_obs_for_policy:
+            if isinstance(transformed_obs, dict):
+                new_obs = {}
+                for k, v in transformed_obs.items():
+                    if isinstance(v, np.ndarray) and len(v.shape) > 0:
+                        # 记录 batch size（从第一个数组key获取）
+                        if self._batch_size == 1 and v.shape[0] > 1:
+                            self._batch_size = v.shape[0]
+                            print(f"🔍 [记录batch_size] batch_size={self._batch_size}")
+                        # 取第一个样本: (B, ...) -> (...)
+                        new_obs[k] = v[0]
+                        print(f"🔍 [移除batch维度] key={k}, 原始shape={v.shape}, 新shape={new_obs[k].shape}")
+                    else:
+                        new_obs[k] = v
+                transformed_obs = new_obs
+            elif isinstance(transformed_obs, np.ndarray) and len(transformed_obs.shape) > 0:
+                if self._batch_size == 1 and transformed_obs.shape[0] > 1:
+                    self._batch_size = transformed_obs.shape[0]
+                transformed_obs = transformed_obs[0]
+        
+        # 步骤3: 如果需要，移除时间维度 (squeeze 掉 size=1 的维度)
+        if self.remove_time_dim_for_policy:
+            if isinstance(transformed_obs, dict):
+                new_obs = {}
+                for k, v in transformed_obs.items():
+                    if isinstance(v, np.ndarray):
+                        print(f"🔍 [移除时间维度] key={k}, 原始 shape={v.shape}")
+                        
+                        # 策略：假设 shape 是 (B, T, ...) 或 (T, B, ...)
+                        # 我们需要 squeeze 掉 T=1 的维度
+                        
+                        # 检查前两个维度哪个是1
+                        if len(v.shape) >= 2:
+                            if v.shape[0] == 1:
+                                # shape 是 (1, B, ...) -> squeeze 第0维
+                                new_v = np.squeeze(v, axis=0)
+                                print(f"🔍 [移除时间维度] squeeze axis=0, 新 shape={new_v.shape}")
+                                new_obs[k] = new_v
+                            elif v.shape[1] == 1:
+                                # shape 是 (B, 1, ...) -> squeeze 第1维
+                                new_v = np.squeeze(v, axis=1)
+                                print(f"🔍 [移除时间维度] squeeze axis=1, 新 shape={new_v.shape}")
+                                new_obs[k] = new_v
+                            else:
+                                # 没有维度为1，保持不变
+                                print(f"🔍 [移除时间维度] 没有维度为1，保持不变")
+                                new_obs[k] = v
+                        elif len(v.shape) == 1 and v.shape[0] == 1:
+                            # 1D 数组且长度为1
+                            new_obs[k] = np.squeeze(v)
+                        else:
+                            new_obs[k] = v
+                    else:
+                        new_obs[k] = v
+                transformed_obs = new_obs
+            elif isinstance(transformed_obs, np.ndarray):
+                if 1 in transformed_obs.shape:
+                    transformed_obs = np.squeeze(transformed_obs)
+        
+        # 调试：打印转换后的 obs keys（发送给 policy 的完整内容）
+        print("=" * 80)
+        print("🔍 [最终发送给 RemotePolicy 的 obs 内容]")
+        if isinstance(transformed_obs, dict):
+            print(f"obs keys: {sorted(transformed_obs.keys())}")
+            for k, v in transformed_obs.items():
+                if hasattr(v, 'shape'):
+                    print(f"  {k}:")
+                    print(f"    - type: {type(v)}")
+                    print(f"    - shape: {v.shape}")
+                    print(f"    - dtype: {v.dtype}")
+                elif isinstance(v, str):
+                    print(f"  {k}:")
+                    print(f"    - type: {type(v)}")
+                    print(f"    - value: {repr(v)}")
+                elif isinstance(v, list):
+                    print(f"  {k}:")
+                    print(f"    - type: list, len={len(v)}")
+                    if len(v) > 0:
+                        print(f"    - first element: {repr(v[0])}")
+                else:
+                    print(f"  {k}:")
+                    print(f"    - type: {type(v)}")
+                    print(f"    - value: {repr(v)}")
+        print("=" * 80)
+        
+        return transformed_obs
+
     def _prefetch(self, obs: Any) -> None:
         """Kick off base_policy(obs) in the background."""
         if not self.prefetch_base_action or self._base_executor is None:
             return
+        
+        # 如果 action buffer 还有足够的 action (>=2个)，不需要 prefetch
+        if self._action_buffer is not None and self._action_buffer_index < self._action_buffer.shape[1] - 1:
+            # buffer 还有至少2个action，不需要prefetch
+            return
+        
         # If we already prefetched for this exact obs object, do nothing.
         if self._base_future is not None and self._base_future_obs is obs:
             return
         self._base_future_obs = obs
-        self._base_future = self._base_executor.submit(self.base_policy, obs)
+        # 在提交给 policy 之前先转换 obs
+        policy_obs = self._transform_obs_for_policy(obs)
+        self._base_future = self._base_executor.submit(self.base_policy, policy_obs)
 
     def _get_base_action(self) -> np.ndarray:
         """Get base action for the current cached obs (possibly waiting for a prefetch)."""
         if self._last_obs is None:
             raise RuntimeError("AddPolicyActionWrapper: base action requested before reset().")
 
+        # 检查 action buffer 是否还有可用的 action
+        if self._action_buffer is not None and self._action_buffer_index < self._action_buffer.shape[1]:
+            # 从 buffer 中取出当前 index 的 action
+            action = self._action_buffer[:, self._action_buffer_index, :]  # shape: (batch_size, action_dim)
+            self._action_buffer_index += 1
+            print(f"🔍 [从 action buffer 取 action] index={self._action_buffer_index-1}, shape={action.shape}")
+            return action
+        
+        # Action buffer 为空或用完了，需要调用 policy 获取新的 action chunk
+        print("🔍 [action buffer 为空，调用 policy 获取新的 action chunk]")
+        
         if self.prefetch_base_action and self._base_future is not None and self._base_future_obs is self._last_obs:
             base_action = self._base_future.result()
         else:
             # Fallback: no prefetch available; do it synchronously.
-            base_action = self.base_policy(self._last_obs)
-        return np.asarray(base_action)
+            # 在调用 policy 之前先转换 obs
+            policy_obs = self._transform_obs_for_policy(self._last_obs)
+            base_action = self.base_policy(policy_obs)
+        
+        # 调试：打印 policy 返回的 action
+        print("=" * 80)
+        print("🔍 [RemotePolicy 返回的 action]")
+        print(f"  - type: {type(base_action)}")
+        if hasattr(base_action, 'shape'):
+            print(f"  - shape: {base_action.shape}")
+            print(f"  - dtype: {base_action.dtype}")
+        elif isinstance(base_action, (list, tuple)):
+            print(f"  - length: {len(base_action)}")
+            if len(base_action) > 0:
+                print(f"  - first element type: {type(base_action[0])}")
+                if hasattr(base_action[0], 'shape'):
+                    print(f"  - first element shape: {base_action[0].shape}")
+        print("=" * 80)
+        
+        base_action_array = np.asarray(base_action)
+        
+        # 检查 action 的 shape
+        if len(base_action_array.shape) == 3:
+            # shape: (batch_size, action_horizon, action_dim) - 这是 action chunking
+            print(f"🔍 [检测到 action chunking] shape={base_action_array.shape}")
+            self._action_buffer = base_action_array
+            self._action_buffer_index = 0
+            # 取第一个 action
+            action = self._action_buffer[:, self._action_buffer_index, :]
+            self._action_buffer_index += 1
+            print(f"🔍 [初始化 action buffer 并取第一个 action] index=0, shape={action.shape}")
+            return action
+        elif len(base_action_array.shape) == 2:
+            # shape: (batch_size, action_dim) - 单个 action，不需要 buffer
+            print(f"🔍 [单个 action，不使用 buffer] shape={base_action_array.shape}")
+            self._action_buffer = None
+            self._action_buffer_index = 0
+            return base_action_array
+        else:
+            # 其他情况，尝试广播或直接返回
+            print(f"⚠️ [未知的 action shape] shape={base_action_array.shape}")
+            # 如果需要，将单个 action 广播到所有 batch
+            if self.broadcast_policy_action and self._batch_size > 1:
+                print(f"🔍 [广播action] 原始shape={base_action_array.shape}, batch_size={self._batch_size}")
+                # 如果 action 是 (action_dim,)，广播成 (batch_size, action_dim)
+                if len(base_action_array.shape) == 1:
+                    base_action_array = np.tile(base_action_array, (self._batch_size, 1))
+                print(f"🔍 [广播action] 新shape={base_action_array.shape}")
+            
+            return base_action_array
 
     def reset(self, **kwargs) -> Any:
         out = self.env.reset(**kwargs)
         self._last_obs = _extract_obs_from_reset(out)
+        
+        # 清空 action buffer (reset 时需要重新预测)
+        self._action_buffer = None
+        self._action_buffer_index = 0
+        print("🔍 [reset] 清空 action buffer")
+        
         # As soon as we have an obs, prefetch the base action for the *next* step call.
         self._prefetch(self._last_obs)
         return out
@@ -339,6 +540,7 @@ class AddPolicyActionWrapper:
 
         base_action = self._get_base_action()
         final_action = base_action + np.asarray(delta_action) if delta_action is not None else base_action
+        # final_action = base_action
         # print('exec compose action: base action + delta action', base_action, delta_action, '->', final_action)
 
         if self.clip_action and self.action_space is not None:
@@ -352,15 +554,31 @@ class AddPolicyActionWrapper:
         if isinstance(out, tuple):
             if len(out) == 4:
                 # (obs, reward, done, info)
-                done = bool(out[2])
+                done_val = out[2]
+                # 处理数组形式的 done (vectorized env)
+                if isinstance(done_val, np.ndarray):
+                    done = bool(done_val.any())  # 任何一个环境done就算done
+                else:
+                    done = bool(done_val)
             elif len(out) == 5:
                 # (obs, reward, terminated, truncated, info)
-                done = bool(out[2] or out[3])
+                terminated = out[2]
+                truncated = out[3]
+                # 处理数组形式的 done (vectorized env)
+                if isinstance(terminated, np.ndarray) or isinstance(truncated, np.ndarray):
+                    done = bool(np.asarray(terminated).any() or np.asarray(truncated).any())
+                else:
+                    done = bool(terminated or truncated)
         if not done:
             self._prefetch(self._last_obs)
         else:
+            # 关键修复：批量环境中任意一个 done，立即清空 action buffer
+            # 因为 done 的环境会 auto-reset，旧的 action buffer 不再适用
             self._base_future = None
             self._base_future_obs = None
+            self._action_buffer = None
+            self._action_buffer_index = 0
+            print("🔍 [done detected] 清空 action buffer，下次 step 将重新获取 action chunk")
         return out
 
     def close(self) -> Any:
