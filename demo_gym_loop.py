@@ -321,7 +321,7 @@ def main() -> None:
     # In `examples/libero/compose_separated.yml`, host 9001 maps to openpi_server:8000.
     parser.add_argument("--policy_uri", default="ws://127.0.0.1:8000")
     # In `examples/libero/compose_separated.yml`, host 9000 maps to runtime:8000 (not necessarily a websocket env server).
-    parser.add_argument("--env_uri", default="ws://127.0.0.1:9000")
+    parser.add_argument("--env_uri", default="ws://127.0.0.1:9010")
     parser.add_argument("--max_steps", type=int, default=5)
     parser.add_argument("--total_epoches", type=int, default=100, help="Total episodes to run")
     parser.add_argument("--total_envs", type=int, default=1, help="Number of parallel environments")
