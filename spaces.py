@@ -83,6 +83,89 @@ def space_from_spec(spec: Dict[str, Any]):
     raise ValueError(f"Unknown space spec type: {t}")
 
 
+def gym_space_to_spec(space) -> Dict[str, Any]:
+    """Convert a gym Space to a JSON/msgpack-friendly spec dict.
+    
+    This is the inverse of space_from_spec().
+    
+    Args:
+        space: A gym.spaces.Space instance
+        
+    Returns:
+        Dict containing the space specification
+    """
+    spaces = _spaces()
+    
+    if isinstance(space, spaces.Box):
+        # Convert low/high to lists for JSON serialization
+        # If all low values are the same and all high values are the same, use scalar
+        low_flat = space.low.flatten()
+        high_flat = space.high.flatten()
+        
+        if np.all(low_flat == low_flat[0]) and np.all(high_flat == high_flat[0]):
+            # Use scalar representation
+            low_spec = float(low_flat[0])
+            high_spec = float(high_flat[0])
+        else:
+            # Use array representation
+            low_spec = space.low.tolist()
+            high_spec = space.high.tolist()
+        
+        return {
+            "type": "Box",
+            "low": low_spec,
+            "high": high_spec,
+            "shape": list(space.shape),
+            "dtype": str(space.dtype)
+        }
+    
+    if isinstance(space, spaces.Discrete):
+        return {
+            "type": "Discrete",
+            "n": int(space.n)
+        }
+    
+    if isinstance(space, spaces.MultiDiscrete):
+        return {
+            "type": "MultiDiscrete",
+            "nvec": space.nvec.tolist()
+        }
+    
+    if isinstance(space, spaces.MultiBinary):
+        return {
+            "type": "MultiBinary",
+            "n": int(space.n)
+        }
+    
+    if isinstance(space, spaces.Tuple):
+        return {
+            "type": "Tuple",
+            "spaces": [gym_space_to_spec(s) for s in space.spaces]
+        }
+    
+    if isinstance(space, spaces.Dict):
+        return {
+            "type": "Dict",
+            "spaces": {k: gym_space_to_spec(v) for k, v in space.spaces.items()}
+        }
+    
+    # Check for Text space (may not exist in older gym versions)
+    Text = getattr(spaces, "Text", None)
+    if Text is not None and isinstance(space, Text):
+        return {
+            "type": "Text",
+            "max_length": int(space.max_length)
+        }
+    
+    # Check for AnySpace
+    if isinstance(space, AnySpace):
+        return {
+            "type": "Any"
+        }
+    
+    raise ValueError(f"Unknown space type: {type(space)}")
+
+
 def libero_default_space_specs(*, resize_size: int, state_dim: int, prompt_max_length: int = 256) -> Tuple[Dict, Dict]:
     """Build observation/action space specs for the Libero env server output."""
     # observation fields produced by libero_env_server.py
